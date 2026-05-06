@@ -46,9 +46,9 @@ def main() -> None:
     if args.dst_root.exists():
         raise SystemExit(f"{args.dst_root} already exists; pick a fresh path or remove it first.")
 
-    template = LeRobotDataset(repo_id="tmp/template", root=args.src_roots[0], download_videos=False)
-    src_action_names = template.features["action"]["names"]
-    right_names = src_action_names[RIGHT_SLICE]
+    srcs = [LeRobotDataset(repo_id="tmp/src", root=root, download_videos=False) for root in args.src_roots]
+    template = srcs[0]
+    right_names = template.features["action"]["names"][RIGHT_SLICE]
     assert all(n.startswith("right_") for n in right_names), f"unexpected names: {right_names}"
     assert len(right_names) == 7
 
@@ -58,11 +58,10 @@ def main() -> None:
         new_features[key]["names"] = list(right_names)
         new_features[key]["shape"] = (7,)
 
-    for root in args.src_roots[1:]:
-        other = LeRobotDataset(repo_id="tmp/check", root=root, download_videos=False)
-        assert other.fps == template.fps, f"fps mismatch at {root}"
-        assert other.features.keys() == template.features.keys(), f"feature-key mismatch at {root}"
-        assert other.meta.robot_type == template.meta.robot_type, f"robot_type mismatch at {root}"
+    for src in srcs[1:]:
+        assert src.fps == template.fps, f"fps mismatch at {src.root}"
+        assert src.features.keys() == template.features.keys(), f"feature-key mismatch at {src.root}"
+        assert src.meta.robot_type == template.meta.robot_type, f"robot_type mismatch at {src.root}"
 
     merged = LeRobotDataset.create(
         repo_id=args.dst_repo_id,
@@ -76,8 +75,7 @@ def main() -> None:
 
     total_eps = 0
     total_frames = 0
-    for root in args.src_roots:
-        src = LeRobotDataset(repo_id="tmp/src", root=root, download_videos=False)
+    for src in srcs:
         for ep_idx in range(src.num_episodes):
             ep = src.meta.episodes[ep_idx]
             lo, hi = ep["dataset_from_index"], ep["dataset_to_index"]
@@ -97,7 +95,7 @@ def main() -> None:
             merged.save_episode()
             total_eps += 1
             total_frames += hi - lo
-        logging.info("merged %s: %d episodes", root.name, src.num_episodes)
+        logging.info("merged %s: %d episodes", src.root.name, src.num_episodes)
 
     logging.info("done: %d episodes / %d frames -> %s", total_eps, total_frames, args.dst_root)
 
