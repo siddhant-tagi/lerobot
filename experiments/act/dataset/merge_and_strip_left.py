@@ -1,4 +1,13 @@
-"""Merge mobileai-lipbalm{,1,2} and strip left arm + left wrist camera.
+"""Merge bimanual LeRobotDatasets and strip the left arm + left wrist camera.
+
+Produces a right-only dataset suitable for training a single-arm policy on data
+recorded with a bimanual rig (`bi_widowxai_follower_robot`).
+
+Usage:
+    uv run python experiments/act/dataset/merge_and_strip_left.py \\
+        --src-roots /data/run1 /data/run2 \\
+        --dst-root /data/run_right_only \\
+        --dst-repo-id mobileai/run_right_only
 
 Targets lerobot 0.4.0 API:
   - dataset[i] returns CHW float32 [0,1] image tensors
@@ -6,86 +15,92 @@ Targets lerobot 0.4.0 API:
   - meta.episodes[i] gives dataset_from_index/dataset_to_index per episode
 """
 
+from __future__ import annotations
+
+import argparse
 import copy
-import os
+import logging
 from pathlib import Path
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-DEFAULT_SRC_ROOTS = [
-    "/home/siddhant/trossen_datasets/local/mobileai-lipbalm",
-    "/home/siddhant/trossen_datasets/local/mobileai-lipbalm1",
-    "/home/siddhant/trossen_datasets/local/mobileai-lipbalm2",
-]
-SRC_ROOTS = [Path(p) for p in os.environ.get("ACT_SRC_ROOTS", ":".join(DEFAULT_SRC_ROOTS)).split(":")]
-DST_REPO_ID = "mobileai/lipbalm_right_only"
-DST_ROOT = Path(
-    os.environ.get(
-        "ACT_DATA_ROOT",
-        "/home/siddhant/trossen_datasets/local/mobileai-lipbalm-right-only",
-    )
-)
 
 DROP_CAMERA = "observation.images.cam_left_wrist"
 RIGHT_SLICE = slice(7, 14)  # right_joint_0..5 + right_left_carriage_joint
 DROP_FRAME_KEYS = ("index", "episode_index", "frame_index", "task_index", "timestamp")
 IMAGE_KEYS = ("observation.images.cam_high", "observation.images.cam_right_wrist")
 
-# Bookkeeping keys present on dataset[i] that aren't features.
-template = LeRobotDataset(repo_id="tmp/template", root=SRC_ROOTS[0], download_videos=False)
 
-src_action_names = template.features["action"]["names"]
-right_names = src_action_names[RIGHT_SLICE]
-assert all(n.startswith("right_") for n in right_names), f"unexpected names: {right_names}"
-assert len(right_names) == 7
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--src-roots", type=Path, nargs="+", required=True)
+    ap.add_argument("--dst-root", type=Path, required=True)
+    ap.add_argument("--dst-repo-id", required=True)
+    ap.add_argument("--image-writer-threads", type=int, default=4)
+    return ap.parse_args()
 
-new_features = copy.deepcopy(template.features)
-new_features.pop(DROP_CAMERA)
-for key in ("action", "observation.state"):
-    new_features[key]["names"] = list(right_names)
-    new_features[key]["shape"] = (7,)
 
-# Schema sanity-check across siblings.
-for root in SRC_ROOTS[1:]:
-    other = LeRobotDataset(repo_id="tmp/check", root=root, download_videos=False)
-    assert other.fps == template.fps
-    assert other.features.keys() == template.features.keys()
-    assert other.meta.robot_type == template.meta.robot_type
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    args = parse_args()
 
-merged = LeRobotDataset.create(
-    repo_id=DST_REPO_ID,
-    root=DST_ROOT,
-    fps=template.fps,
-    features=new_features,
-    robot_type=template.meta.robot_type,
-    use_videos=True,
-    image_writer_threads=4,
-)
+    if args.dst_root.exists():
+        raise SystemExit(f"{args.dst_root} already exists; pick a fresh path or remove it first.")
 
-total_eps = 0
-total_frames = 0
+    template = LeRobotDataset(repo_id="tmp/template", root=args.src_roots[0], download_videos=False)
+    src_action_names = template.features["action"]["names"]
+    right_names = src_action_names[RIGHT_SLICE]
+    assert all(n.startswith("right_") for n in right_names), f"unexpected names: {right_names}"
+    assert len(right_names) == 7
 
-for root in SRC_ROOTS:
-    src = LeRobotDataset(repo_id="tmp/src", root=root, download_videos=False)
-    for ep_idx in range(src.num_episodes):
-        ep = src.meta.episodes[ep_idx]
-        lo, hi = ep["dataset_from_index"], ep["dataset_to_index"]
-        task_str = ep["tasks"][0]  # one task per episode in this dataset
-        for i in range(lo, hi):
-            frame = src[i]
-            for k in DROP_FRAME_KEYS:
-                frame.pop(k, None)
-            frame.pop(DROP_CAMERA, None)
-            frame["action"] = frame["action"][RIGHT_SLICE]
-            frame["observation.state"] = frame["observation.state"][RIGHT_SLICE]
-            for img_key in IMAGE_KEYS:
-                # dataset[i] returns CHW float32; validator/writer want HWC.
-                frame[img_key] = frame[img_key].permute(1, 2, 0).contiguous()
-            frame["task"] = task_str
-            merged.add_frame(frame)
-        merged.save_episode()
-        total_eps += 1
-        total_frames += (hi - lo)
-    print(f"merged {root.name}: {src.num_episodes} episodes")
+    new_features = copy.deepcopy(template.features)
+    new_features.pop(DROP_CAMERA)
+    for key in ("action", "observation.state"):
+        new_features[key]["names"] = list(right_names)
+        new_features[key]["shape"] = (7,)
 
-print(f"\nDone. {total_eps} episodes / {total_frames} frames -> {DST_ROOT}")
+    for root in args.src_roots[1:]:
+        other = LeRobotDataset(repo_id="tmp/check", root=root, download_videos=False)
+        assert other.fps == template.fps, f"fps mismatch at {root}"
+        assert other.features.keys() == template.features.keys(), f"feature-key mismatch at {root}"
+        assert other.meta.robot_type == template.meta.robot_type, f"robot_type mismatch at {root}"
+
+    merged = LeRobotDataset.create(
+        repo_id=args.dst_repo_id,
+        root=args.dst_root,
+        fps=template.fps,
+        features=new_features,
+        robot_type=template.meta.robot_type,
+        use_videos=True,
+        image_writer_threads=args.image_writer_threads,
+    )
+
+    total_eps = 0
+    total_frames = 0
+    for root in args.src_roots:
+        src = LeRobotDataset(repo_id="tmp/src", root=root, download_videos=False)
+        for ep_idx in range(src.num_episodes):
+            ep = src.meta.episodes[ep_idx]
+            lo, hi = ep["dataset_from_index"], ep["dataset_to_index"]
+            task_str = ep["tasks"][0]
+            for i in range(lo, hi):
+                frame = src[i]
+                for k in DROP_FRAME_KEYS:
+                    frame.pop(k, None)
+                frame.pop(DROP_CAMERA, None)
+                frame["action"] = frame["action"][RIGHT_SLICE]
+                frame["observation.state"] = frame["observation.state"][RIGHT_SLICE]
+                for img_key in IMAGE_KEYS:
+                    # dataset[i] returns CHW float32; validator/writer want HWC.
+                    frame[img_key] = frame[img_key].permute(1, 2, 0).contiguous()
+                frame["task"] = task_str
+                merged.add_frame(frame)
+            merged.save_episode()
+            total_eps += 1
+            total_frames += hi - lo
+        logging.info("merged %s: %d episodes", root.name, src.num_episodes)
+
+    logging.info("done: %d episodes / %d frames -> %s", total_eps, total_frames, args.dst_root)
+
+
+if __name__ == "__main__":
+    main()

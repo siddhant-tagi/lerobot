@@ -30,12 +30,10 @@ import logging
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
 
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies import make_policy, make_pre_post_processors
 from lerobot.utils.constants import ACTION, OBS_PREFIX
+
+from _common import build_inference_stack
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,31 +54,13 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
 
-    cfg = PreTrainedConfig.from_pretrained(args.policy_path)
-    cfg.pretrained_path = str(args.policy_path)
-    if args.device:
-        torch.device(args.device)  # validate
-        cfg.device = args.device
-    device = torch.device(cfg.device)
-
-    logging.info("Loading dataset %s (episodes=%s)", args.dataset_repo_id, args.episodes)
-    ds = LeRobotDataset(
-        repo_id=args.dataset_repo_id,
-        root=args.dataset_root,
+    loader, policy, preprocessor, postprocessor, _ds, device = build_inference_stack(
+        policy_path=args.policy_path,
+        dataset_repo_id=args.dataset_repo_id,
+        dataset_root=args.dataset_root,
         episodes=list(args.episodes),
-    )
-    # batch_size=1 + shuffle=False are mandatory: ACT's select_action maintains
-    # an internal action queue that must see frames in order. num_workers
-    # overlaps video decode with GPU inference.
-    loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda")
-
-    logging.info("Loading policy from %s", args.policy_path)
-    policy = make_policy(cfg=cfg, ds_meta=ds.meta)
-    policy.eval()
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=cfg,
-        pretrained_path=str(args.policy_path),
-        preprocessor_overrides={"device_processor": {"device": str(device)}},
+        device=args.device,
+        num_workers=args.num_workers,
     )
 
     per_episode: dict[int, dict[str, float]] = {}
@@ -113,11 +93,8 @@ def main() -> None:
             logging.info("episode %d", ep)
 
         gt_action = batch[ACTION].to(device, non_blocking=True)
-        # batch already has a leading dim from DataLoader; preprocessor moves
-        # tensors to device via the configured device_processor step.
         obs = {k: v for k, v in batch.items() if k.startswith(OBS_PREFIX) or k == "task"}
-        obs = preprocessor(obs)
-        pred = postprocessor(policy.select_action(obs))
+        pred = postprocessor(policy.select_action(preprocessor(obs))).to(device)
 
         diff = pred - gt_action
         sum_l1 = sum_l1 + diff.abs().mean()
