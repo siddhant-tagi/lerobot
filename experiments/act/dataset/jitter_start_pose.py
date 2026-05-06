@@ -20,11 +20,22 @@ import av
 import numpy as np
 import pandas as pd
 
+try:
+    from lerobot.datasets.compute_stats import (
+        aggregate_stats,
+        auto_downsample_height_width,
+        get_feature_stats,
+        sample_indices,
+    )
+except ImportError as e:  # pragma: no cover - the runtime venv is expected to have lerobot
+    raise SystemExit(f"lerobot.datasets.compute_stats unavailable: {e}") from e
+
 SRC = Path("/home/siddhant/trossen_datasets/local/mobileai-lipbalm-right-only")
 DST = Path("/home/siddhant/trossen_datasets/local/mobileai-lipbalm-right-only-jittered")
 SEED = 0
 K_MIN, K_MAX = 5, 30   # inclusive range, frames
 VIDEO_KEYS = ["observation.images.cam_high", "observation.images.cam_right_wrist"]
+SCALAR_COLS = ("timestamp", "frame_index", "episode_index", "index", "task_index")
 
 
 def sample_drops(rng: np.random.Generator, n_episodes: int) -> np.ndarray:
@@ -46,42 +57,84 @@ def slice_data(df: pd.DataFrame, drops: np.ndarray, fps: int) -> pd.DataFrame:
     return out
 
 
-def per_feature_stats(arr: np.ndarray) -> dict:
-    """Return LeRobot-style per-feature stats for a 1D or 2D array (rows = frames)."""
-    a = np.asarray(arr)
-    flat_axis = 0
-    out = {
-        "min": a.min(axis=flat_axis).tolist(),
-        "max": a.max(axis=flat_axis).tolist(),
-        "mean": a.mean(axis=flat_axis).tolist(),
-        "std": a.std(axis=flat_axis).tolist(),
-        "count": [int(a.shape[0])],
-        "q01": np.quantile(a, 0.01, axis=flat_axis).tolist(),
-        "q10": np.quantile(a, 0.10, axis=flat_axis).tolist(),
-        "q50": np.quantile(a, 0.50, axis=flat_axis).tolist(),
-        "q90": np.quantile(a, 0.90, axis=flat_axis).tolist(),
-        "q99": np.quantile(a, 0.99, axis=flat_axis).tolist(),
-    }
-    return out
+def compute_image_stats_per_episode(
+    src_mp4: Path,
+    drops: np.ndarray,
+    src_from: np.ndarray,
+    src_to: np.ndarray,
+) -> dict[int, dict[str, np.ndarray]]:
+    """Decode src video once; per-channel stats over sub-sampled kept frames per episode.
+
+    Returns {ep_idx: stats_dict} with each stat shaped (3,1,1) and pixels normalized to [0,1],
+    matching what compute_episode_stats produces for image/video features.
+    """
+    n_eps = len(src_from)
+    src_to_ep: dict[int, int] = {}
+    for ep in range(n_eps):
+        L_new = int(src_to[ep] - src_from[ep] - drops[ep])
+        if L_new <= 0:
+            continue
+        for i in sample_indices(L_new):
+            src_to_ep[int(src_from[ep] + drops[ep] + i)] = ep
+
+    frames_by_ep: list[list[np.ndarray]] = [[] for _ in range(n_eps)]
+    in_container = av.open(str(src_mp4))
+    for src_idx, frame in enumerate(in_container.decode(video=0)):
+        ep = src_to_ep.get(src_idx)
+        if ep is not None:
+            arr = frame.to_ndarray(format="rgb24").transpose(2, 0, 1)  # C H W uint8
+            frames_by_ep[ep].append(auto_downsample_height_width(arr))
+    in_container.close()
+
+    stats_by_ep: dict[int, dict[str, np.ndarray]] = {}
+    for ep, frames in enumerate(frames_by_ep):
+        if not frames:
+            continue
+        arr = np.stack(frames, axis=0)  # N C H W uint8
+        s = get_feature_stats(arr, axis=(0, 2, 3), keepdims=True)
+        stats_by_ep[ep] = {
+            k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in s.items()
+        }
+    return stats_by_ep
 
 
-def scalar_stats(arr: np.ndarray) -> dict:
-    a = np.asarray(arr).reshape(-1)
-    return {
-        "min": [a.min().item()],
-        "max": [a.max().item()],
-        "mean": [a.mean().item()],
-        "std": [a.std().item()],
-        "count": [int(a.shape[0])],
-        "q01": [np.quantile(a, 0.01).item()],
-        "q10": [np.quantile(a, 0.10).item()],
-        "q50": [np.quantile(a, 0.50).item()],
-        "q90": [np.quantile(a, 0.90).item()],
-        "q99": [np.quantile(a, 0.99).item()],
-    }
+def compute_per_episode_stats(
+    df_new: pd.DataFrame,
+    eps_old_sorted: pd.DataFrame,
+    drops: np.ndarray,
+    src_video_paths: dict[str, Path],
+) -> list[dict[str, dict[str, np.ndarray]]]:
+    """Per-episode stats for vectors/scalars (from df_new) + images (from src videos)."""
+    n_eps = len(eps_old_sorted)
+    per_ep: list[dict[str, dict[str, np.ndarray]]] = [dict() for _ in range(n_eps)]
+
+    for ep_idx in range(n_eps):
+        ep_df = df_new[df_new["episode_index"] == ep_idx]
+        action = np.stack(ep_df["action"].to_numpy()).astype(np.float32)
+        state = np.stack(ep_df["observation.state"].to_numpy()).astype(np.float32)
+        per_ep[ep_idx]["action"] = get_feature_stats(action, axis=0, keepdims=False)
+        per_ep[ep_idx]["observation.state"] = get_feature_stats(state, axis=0, keepdims=False)
+        for col in SCALAR_COLS:
+            arr = np.asarray(ep_df[col].to_numpy(), dtype=np.float64).reshape(-1)
+            per_ep[ep_idx][col] = get_feature_stats(arr, axis=0, keepdims=False)
+
+    src_from = eps_old_sorted["dataset_from_index"].to_numpy()
+    src_to = eps_old_sorted["dataset_to_index"].to_numpy()
+    for vk, src_mp4 in src_video_paths.items():
+        print(f"computing image stats from {vk} ...")
+        img_stats = compute_image_stats_per_episode(src_mp4, drops, src_from, src_to)
+        for ep_idx, s in img_stats.items():
+            per_ep[ep_idx][vk] = s
+    return per_ep
 
 
-def rebuild_episodes(eps_old: pd.DataFrame, df_new: pd.DataFrame, drops: np.ndarray, fps: int) -> pd.DataFrame:
+def rebuild_episodes(
+    eps_old: pd.DataFrame,
+    df_new: pd.DataFrame,
+    drops: np.ndarray,
+    fps: int,
+    per_ep_stats: list[dict[str, dict[str, np.ndarray]]],
+) -> pd.DataFrame:
     eps = eps_old.copy().sort_values("episode_index").reset_index(drop=True)
     new_lengths = []
     new_from = []
@@ -113,25 +166,16 @@ def rebuild_episodes(eps_old: pd.DataFrame, df_new: pd.DataFrame, drops: np.ndar
         eps[f"videos/{vk}/to_timestamp"] = new_video_to
         # chunk_index / file_index remain 0 (single file)
 
-    # Recompute non-image stats per episode (action, state, scalars).
-    for ep_idx in eps["episode_index"].to_numpy():
-        ep_idx = int(ep_idx)
-        ep_df = df_new[df_new["episode_index"] == ep_idx]
-        action = np.stack(ep_df["action"].to_numpy())
-        state = np.stack(ep_df["observation.state"].to_numpy())
-        for prefix, stats in [
-            ("stats/action", per_feature_stats(action)),
-            ("stats/observation.state", per_feature_stats(state)),
-            ("stats/timestamp", scalar_stats(ep_df["timestamp"].to_numpy())),
-            ("stats/frame_index", scalar_stats(ep_df["frame_index"].to_numpy())),
-            ("stats/episode_index", scalar_stats(ep_df["episode_index"].to_numpy())),
-            ("stats/index", scalar_stats(ep_df["index"].to_numpy())),
-            ("stats/task_index", scalar_stats(ep_df["task_index"].to_numpy())),
-        ]:
-            for k, v in stats.items():
-                eps.loc[eps["episode_index"] == ep_idx, f"{prefix}/{k}"] = pd.Series(
-                    [v], index=eps.index[eps["episode_index"] == ep_idx]
-                )
+    # Write all stats columns (action/state/scalars + observation.images.*) from per_ep_stats.
+    n_eps = len(eps)
+    stat_cols: dict[str, list] = {}
+    for ep_idx in range(n_eps):
+        for feature_key, stats in per_ep_stats[ep_idx].items():
+            for stat_key, val in stats.items():
+                col = f"stats/{feature_key}/{stat_key}"
+                stat_cols.setdefault(col, [None] * n_eps)[ep_idx] = np.asarray(val).tolist()
+    for col, vals in stat_cols.items():
+        eps[col] = vals
     return eps
 
 
@@ -185,6 +229,19 @@ def reencode_video(src_mp4: Path, dst_mp4: Path, drops: np.ndarray,
     return out_idx
 
 
+def write_stats_json(
+    per_ep_stats: list[dict[str, dict[str, np.ndarray]]],
+    dst_path: Path,
+) -> None:
+    """Aggregate per-episode stats into the dataset-level meta/stats.json."""
+    aggregated = aggregate_stats(per_ep_stats)
+    out = {
+        feat: {k: np.asarray(v).tolist() for k, v in stats.items()}
+        for feat, stats in aggregated.items()
+    }
+    dst_path.write_text(json.dumps(out, indent=4, sort_keys=True))
+
+
 def main():
     info = json.loads((SRC / "meta" / "info.json").read_text())
     fps = int(info["fps"])
@@ -206,10 +263,14 @@ def main():
     df_new = slice_data(df, drops, fps)
     print(f"sliced data: {len(df_new)} rows")
 
-    # 2) Rebuild episode meta
-    eps_new = rebuild_episodes(eps_old_sorted, df_new, drops, fps)
+    # 2) Per-episode stats (vectors/scalars from df_new + images decoded from src videos)
+    src_video_paths = {vk: SRC / "videos" / vk / "chunk-000" / "file-000.mp4" for vk in VIDEO_KEYS}
+    per_ep_stats = compute_per_episode_stats(df_new, eps_old_sorted, drops, src_video_paths)
 
-    # 3) Write outputs
+    # 3) Rebuild episode meta (incl. all stats columns)
+    eps_new = rebuild_episodes(eps_old_sorted, df_new, drops, fps, per_ep_stats)
+
+    # 4) Write outputs
     if DST.exists():
         shutil.rmtree(DST)
     (DST / "data" / "chunk-000").mkdir(parents=True, exist_ok=True)
@@ -218,8 +279,9 @@ def main():
     df_new.to_parquet(DST / "data" / "chunk-000" / "file-000.parquet", index=False)
     eps_new.to_parquet(DST / "meta" / "episodes" / "chunk-000" / "file-000.parquet", index=False)
     shutil.copy(SRC / "meta" / "tasks.parquet", DST / "meta" / "tasks.parquet")
+    write_stats_json(per_ep_stats, DST / "meta" / "stats.json")
 
-    # 4) Re-encode videos
+    # 5) Re-encode videos
     for vk in VIDEO_KEYS:
         src_mp4 = SRC / "videos" / vk / "chunk-000" / "file-000.mp4"
         dst_mp4 = DST / "videos" / vk / "chunk-000" / "file-000.mp4"
@@ -228,7 +290,7 @@ def main():
         print(f"  wrote {n_out} frames -> {dst_mp4}")
         assert n_out == len(df_new), f"video frame count {n_out} != data rows {len(df_new)}"
 
-    # 5) Update info.json
+    # 6) Update info.json
     info_new = dict(info)
     info_new["total_frames"] = int(len(df_new))
     info_new["splits"] = {"train": f"0:{n_episodes}"}
@@ -241,7 +303,7 @@ def main():
     info_new["video_files_size_in_mb"] = max(int(video_size_mb), 1)
     (DST / "meta" / "info.json").write_text(json.dumps(info_new, indent=4))
 
-    # 6) Save the drop schedule for reproducibility
+    # 7) Save the drop schedule for reproducibility
     (DST / "meta" / "jitter_drops.json").write_text(json.dumps({
         "seed": SEED,
         "k_min": K_MIN,
